@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Train a PPO agent using JAX on the specified environment."""
+"""Train a SHAC agent using JAX on the specified environment."""
 
 import datetime
 import functools
@@ -24,9 +24,13 @@ import warnings
 from absl import app
 from absl import flags
 from absl import logging
-from brax.training.agents.ppo import networks as ppo_networks
-from brax.training.agents.ppo import networks_vision as ppo_networks_vision
-from brax.training.agents.ppo import train as ppo
+# from brax.training.agents.ppo import networks as ppo_networks
+# from brax.training.agents.ppo import networks_vision as ppo_networks_vision
+# from brax.training.agents.ppo import train as ppo
+
+from shac import networks as shac_networks
+from shac import train as shac
+
 from etils import epath
 import jax
 import jax.numpy as jp
@@ -109,17 +113,14 @@ _NUM_UPDATES_PER_BATCH = flags.DEFINE_integer(
     "num_updates_per_batch", 8, "Number of updates per batch"
 )
 _DISCOUNTING = flags.DEFINE_float("discounting", 0.97, "Discounting")
-_LEARNING_RATE = flags.DEFINE_float("learning_rate", 5e-4, "Learning rate")
+_ACTOR_LEARNING_RATE = flags.DEFINE_float("actor_learning_rate", 5e-4, "Actor learning rate")
+_CRITIC_LEARNING_RATE = flags.DEFINE_float("critic_learning_rate", 5e-4, "Critic learning rate")
 _ENTROPY_COST = flags.DEFINE_float("entropy_cost", 5e-3, "Entropy cost")
 _NUM_ENVS = flags.DEFINE_integer("num_envs", 1024, "Number of environments")
 _NUM_EVAL_ENVS = flags.DEFINE_integer(
     "num_eval_envs", 128, "Number of evaluation environments"
 )
 _BATCH_SIZE = flags.DEFINE_integer("batch_size", 256, "Batch size")
-_MAX_GRAD_NORM = flags.DEFINE_float("max_grad_norm", 1.0, "Max grad norm")
-_CLIPPING_EPSILON = flags.DEFINE_float(
-    "clipping_epsilon", 0.2, "Clipping epsilon for PPO"
-)
 _POLICY_HIDDEN_LAYER_SIZES = flags.DEFINE_list(
     "policy_hidden_layer_sizes",
     [64, 64, 64],
@@ -162,22 +163,62 @@ _TRAINING_METRICS_STEPS = flags.DEFINE_integer(
     " experiences slowdown.",
 )
 
+# SHAC specific parameters
+_TAU = flags.DEFINE_float(
+    "tau", 0.005, "Target network update rate (1-alpha from the original paper)"
+)
+_LAMBDA = flags.DEFINE_float(
+    "lambda", 0.95, "GAE lambda parameter for advantage estimation"
+)
+_TD_LAMBDA = flags.DEFINE_boolean(
+    "td_lambda", True, "Use TD(lambda) for critic updates"
+)
+
 
 def get_rl_config(env_name: str) -> config_dict.ConfigDict:
-  if env_name in mujoco_playground.manipulation._envs:
-    if _VISION.value:
-      return manipulation_params.brax_vision_ppo_config(env_name)
-    return manipulation_params.brax_ppo_config(env_name)
-  elif env_name in mujoco_playground.locomotion._envs:
-    if _VISION.value:
-      return locomotion_params.brax_vision_ppo_config(env_name)
-    return locomotion_params.brax_ppo_config(env_name)
-  elif env_name in mujoco_playground.dm_control_suite._envs:
-    if _VISION.value:
-      return dm_control_suite_params.brax_vision_ppo_config(env_name)
-    return dm_control_suite_params.brax_ppo_config(env_name)
+  from ml_collections import config_dict
+  from mujoco_playground._src import locomotion
 
-  raise ValueError(f"Env {env_name} not found in {registry.ALL_ENVS}.")
+  assert env_name == "G1JoystickFlatTerrain"
+  env_config = locomotion.get_default_config(env_name)
+  rl_config = config_dict.create(
+      num_timesteps=100_000_000,
+      num_evals=10,
+      reward_scaling=1.0,
+      episode_length=env_config.episode_length,
+      normalize_observations=True,
+      action_repeat=1,
+      unroll_length=20,
+      num_minibatches=32,
+      num_updates_per_batch=4,
+      discounting=0.97,
+      actor_learning_rate=3e-4,
+      critic_learning_rate=3e-4,
+      entropy_cost=1e-2,
+      num_envs=8192,
+      batch_size=256,
+      # SHAC specific parameters
+      tau=0.005,  # 1-alpha from the original paper
+      lambda_=0.95,  # GAE lambda parameter
+      td_lambda=True,  # Use TD(lambda) for critic updates
+      num_resets_per_eval=1,  # Number of resets per evaluation
+      network_factory=config_dict.create(
+          policy_hidden_layer_sizes=(128, 128, 128, 128),
+          value_hidden_layer_sizes=(256, 256, 256, 256, 256),
+          policy_obs_key="state",
+          value_obs_key="state",
+      ),
+  )
+  rl_config.num_timesteps = 200_000_000
+  rl_config.num_evals = 20
+  rl_config.entropy_cost = 0.005
+  rl_config.network_factory = config_dict.create(
+      policy_hidden_layer_sizes=(512, 256, 128),
+      value_hidden_layer_sizes=(512, 256, 128),
+      policy_obs_key="state",
+      value_obs_key="privileged_state",
+  )
+  return rl_config
 
 
 def rscope_fn(full_states, obs, rew, done):
@@ -206,69 +247,72 @@ def main(argv):
   # Load environment configuration
   env_cfg = registry.get_default_config(_ENV_NAME.value)
 
-  ppo_params = get_rl_config(_ENV_NAME.value)
+  shac_params = get_rl_config(_ENV_NAME.value)
 
   if _NUM_TIMESTEPS.present:
-    ppo_params.num_timesteps = _NUM_TIMESTEPS.value
+    shac_params.num_timesteps = _NUM_TIMESTEPS.value
   if _PLAY_ONLY.present:
-    ppo_params.num_timesteps = 0
+    shac_params.num_timesteps = 0
   if _NUM_EVALS.present:
-    ppo_params.num_evals = _NUM_EVALS.value
+    shac_params.num_evals = _NUM_EVALS.value
   if _REWARD_SCALING.present:
-    ppo_params.reward_scaling = _REWARD_SCALING.value
+    shac_params.reward_scaling = _REWARD_SCALING.value
   if _EPISODE_LENGTH.present:
-    ppo_params.episode_length = _EPISODE_LENGTH.value
+    shac_params.episode_length = _EPISODE_LENGTH.value
   if _NORMALIZE_OBSERVATIONS.present:
-    ppo_params.normalize_observations = _NORMALIZE_OBSERVATIONS.value
+    shac_params.normalize_observations = _NORMALIZE_OBSERVATIONS.value
   if _ACTION_REPEAT.present:
-    ppo_params.action_repeat = _ACTION_REPEAT.value
+    shac_params.action_repeat = _ACTION_REPEAT.value
   if _UNROLL_LENGTH.present:
-    ppo_params.unroll_length = _UNROLL_LENGTH.value
+    shac_params.unroll_length = _UNROLL_LENGTH.value
   if _NUM_MINIBATCHES.present:
-    ppo_params.num_minibatches = _NUM_MINIBATCHES.value
+    shac_params.num_minibatches = _NUM_MINIBATCHES.value
   if _NUM_UPDATES_PER_BATCH.present:
-    ppo_params.num_updates_per_batch = _NUM_UPDATES_PER_BATCH.value
-  if _DISCOUNTING.present:
-    ppo_params.discounting = _DISCOUNTING.value
-  if _LEARNING_RATE.present:
-    ppo_params.learning_rate = _LEARNING_RATE.value
+    shac_params.num_updates_per_batch = _NUM_UPDATES_PER_BATCH.value
+  if _ACTOR_LEARNING_RATE.present:
+    shac_params.actor_learning_rate = _ACTOR_LEARNING_RATE.value
+  if _CRITIC_LEARNING_RATE.present:
+    shac_params.critic_learning_rate = _CRITIC_LEARNING_RATE.value
   if _ENTROPY_COST.present:
-    ppo_params.entropy_cost = _ENTROPY_COST.value
+    shac_params.entropy_cost = _ENTROPY_COST.value
+  if _DISCOUNTING.present:
+    shac_params.discounting = _DISCOUNTING.value
   if _NUM_ENVS.present:
-    ppo_params.num_envs = _NUM_ENVS.value
+    shac_params.num_envs = _NUM_ENVS.value
   if _NUM_EVAL_ENVS.present:
-    ppo_params.num_eval_envs = _NUM_EVAL_ENVS.value
+    shac_params.num_eval_envs = _NUM_EVAL_ENVS.value
   if _BATCH_SIZE.present:
-    ppo_params.batch_size = _BATCH_SIZE.value
-  if _MAX_GRAD_NORM.present:
-    ppo_params.max_grad_norm = _MAX_GRAD_NORM.value
-  if _CLIPPING_EPSILON.present:
-    ppo_params.clipping_epsilon = _CLIPPING_EPSILON.value
+    shac_params.batch_size = _BATCH_SIZE.value
   if _POLICY_HIDDEN_LAYER_SIZES.present:
-    ppo_params.network_factory.policy_hidden_layer_sizes = list(
+    shac_params.network_factory.policy_hidden_layer_sizes = list(
         map(int, _POLICY_HIDDEN_LAYER_SIZES.value)
     )
   if _VALUE_HIDDEN_LAYER_SIZES.present:
-    ppo_params.network_factory.value_hidden_layer_sizes = list(
+    shac_params.network_factory.value_hidden_layer_sizes = list(
         map(int, _VALUE_HIDDEN_LAYER_SIZES.value)
     )
   if _POLICY_OBS_KEY.present:
-    ppo_params.network_factory.policy_obs_key = _POLICY_OBS_KEY.value
+    shac_params.network_factory.policy_obs_key = _POLICY_OBS_KEY.value
   if _VALUE_OBS_KEY.present:
-    ppo_params.network_factory.value_obs_key = _VALUE_OBS_KEY.value
-  if _VISION.value:
-    env_cfg.vision = True
-    env_cfg.vision_config.render_batch_size = ppo_params.num_envs
+    shac_params.network_factory.value_obs_key = _VALUE_OBS_KEY.value
   env = registry.load(_ENV_NAME.value, config=env_cfg)
   if _RUN_EVALS.present:
-    ppo_params.run_evals = _RUN_EVALS.value
+    shac_params.run_evals = _RUN_EVALS.value
   if _LOG_TRAINING_METRICS.present:
-    ppo_params.log_training_metrics = _LOG_TRAINING_METRICS.value
+    shac_params.log_training_metrics = _LOG_TRAINING_METRICS.value
   if _TRAINING_METRICS_STEPS.present:
-    ppo_params.training_metrics_steps = _TRAINING_METRICS_STEPS.value
+    shac_params.training_metrics_steps = _TRAINING_METRICS_STEPS.value
+
+  # SHAC specific parameters
+  if _TAU.present:
+    shac_params.tau = _TAU.value
+  if _LAMBDA.present:
+    shac_params.lambda_ = _LAMBDA.value
+  if _TD_LAMBDA.present:
+    shac_params.td_lambda = _TD_LAMBDA.value
 
   print(f"Environment Config:\n{env_cfg}")
-  print(f"PPO Training Parameters:\n{ppo_params}")
+  print(f"SHAC Training Parameters:\n{shac_params}")
 
   # Generate unique experiment name
   now = datetime.datetime.now()
@@ -279,7 +323,7 @@ def main(argv):
   print(f"Experiment name: {exp_name}")
 
   # Set up logging directory
-  logdir = epath.Path("logs/ppo").resolve() / exp_name
+  logdir = epath.Path("logs/shac").resolve() / exp_name
   logdir.mkdir(parents=True, exist_ok=True)
   print(f"Logs are being stored in: {logdir}")
 
@@ -320,18 +364,14 @@ def main(argv):
   with open(ckpt_path / "config.json", "w", encoding="utf-8") as fp:
     json.dump(env_cfg.to_dict(), fp, indent=4)
 
-  training_params = dict(ppo_params)
+  training_params = dict(shac_params)
   if "network_factory" in training_params:
     del training_params["network_factory"]
 
-  network_fn = (
-      ppo_networks_vision.make_ppo_networks_vision
-      if _VISION.value
-      else ppo_networks.make_ppo_networks
-  )
-  if hasattr(ppo_params, "network_factory"):
+  network_fn = shac_networks.make_shac_networks
+  if hasattr(shac_params, "network_factory"):
     network_factory = functools.partial(
-        network_fn, **ppo_params.network_factory
+        network_fn, **shac_params.network_factory
     )
   else:
     network_factory = network_fn
@@ -341,27 +381,13 @@ def main(argv):
         _ENV_NAME.value
     )
 
-  if _VISION.value:
-    env = wrapper.wrap_for_brax_training(
-        env,
-        vision=True,
-        num_vision_envs=env_cfg.vision_config.render_batch_size,
-        episode_length=ppo_params.episode_length,
-        action_repeat=ppo_params.action_repeat,
-        randomization_fn=training_params.get("randomization_fn"),
-    )
-
-  num_eval_envs = (
-      ppo_params.num_envs
-      if _VISION.value
-      else ppo_params.get("num_eval_envs", 128)
-  )
+  num_eval_envs = shac_params.get("num_eval_envs", 128)
 
   if "num_eval_envs" in training_params:
     del training_params["num_eval_envs"]
 
   train_fn = functools.partial(
-      ppo.train,
+      shac.train,
       **training_params,
       network_factory=network_factory,
       seed=_SEED.value,
@@ -417,8 +443,8 @@ def main(argv):
       )
       rscope_env = wrapper.wrap_for_brax_training(
           rscope_env,
-          episode_length=ppo_params.episode_length,
-          action_repeat=ppo_params.action_repeat,
+          episode_length=shac_params.episode_length,
+          action_repeat=shac_params.action_repeat,
           randomization_fn=training_params.get("randomization_fn"),
       )
     else:
@@ -426,7 +452,7 @@ def main(argv):
 
     rscope_handle = rscope_utils.BraxRolloutSaver(
         rscope_env,
-        ppo_params,
+        shac_params,
         _VISION.value,
         _RSCOPE_ENVS.value,
         _DETERMINISTIC_RSCOPE.value,
@@ -507,17 +533,6 @@ def main(argv):
   # print(action_grad)
   # breakpoint()
 
-  if _VISION.value:
-    reset_states = jax.tree_util.tree_map(lambda x: x[0], reset_states)
-  traj_stacked = jax.jit(jax.vmap(do_rollout))(rng, reset_states)
-  trajectories = [None] * _NUM_VIDEOS.value
-  for i in range(_NUM_VIDEOS.value):
-    t = jax.tree.map(lambda x, i=i: x[i], traj_stacked)
-    trajectories[i] = [
-        jax.tree.map(lambda x, j=j: x[j], t)
-        for j in range(_EPISODE_LENGTH.value)
-    ]
-
   # Render and save the rollout.
   render_every = 2
   fps = 1.0 / eval_env.dt / render_every
@@ -531,7 +546,7 @@ def main(argv):
     frames = eval_env.render(
         traj, height=480, width=640, scene_option=scene_option, camera="track",
     )
-    media.write_video(f"ppo_rollout{i}.mp4", frames, fps=fps)
+    media.write_video(f"shac_rollout{i}.mp4", frames, fps=fps)
     print(f"Rollout video saved as 'rollout{i}.mp4'.")
 
 
