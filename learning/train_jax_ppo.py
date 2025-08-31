@@ -529,10 +529,10 @@ def main(argv):
   for i, rollout in enumerate(trajectories):
     traj = rollout[::render_every]
     frames = eval_env.render(
-        traj, height=480, width=640, scene_option=scene_option, camera="track",
+        traj, height=480, width=640, scene_option=scene_option, camera="lookatcart", #"track",
     )
     media.write_video(f"ppo_rollout{i}.mp4", frames, fps=fps)
-    print(f"Rollout video saved as 'rollout{i}.mp4'.")
+    print(f"Rollout video saved as 'ppo_rollout{i}.mp4'.")
 
 
 if __name__ == "__main__":

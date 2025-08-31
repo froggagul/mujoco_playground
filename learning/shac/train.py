@@ -26,6 +26,7 @@ from brax import base
 from brax import envs
 from brax.envs import wrappers
 from brax.training import acting
+from brax.training import gradients
 from brax.training import logger as metric_logger
 from brax.training import pmap
 from brax.training import types
@@ -34,11 +35,15 @@ from brax.training.acme import specs
 from shac import losses as shac_losses
 from shac import networks as shac_networks
 from shac import checkpoint
-from shac import gradients
 from brax.training.types import Params
 from brax.training.types import PRNGKey
 import flax
 import jax
+jax.config.update("jax_compilation_cache_dir", "__jaxcache__")
+jax.config.update("jax_debug_nans", True)
+jax.config.update("jax_enable_x64", True)
+# jax.config.update('jax_default_matmul_precision', 'highest')
+
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -139,7 +144,7 @@ def train(
     normalize_observations: bool = False,
 
     reward_scaling: float = 1.,
-    tau: float = 0.005,  # this is 1-alpha from the original paper
+    alpha: float = 0.995,
     lambda_: float = .95,
     td_lambda: bool = True,
 
@@ -203,6 +208,9 @@ def train(
           * max(num_resets_per_eval, 1)
       )
   ).astype(int)
+  print("num_timesteps:", num_timesteps)
+  print("env_step_per_training_step:", env_step_per_training_step)
+  print("num_training_steps_per_epoch:", num_training_steps_per_epoch)
 
   key = jax.random.PRNGKey(seed)
   global_key, local_key = jax.random.split(key)
@@ -251,11 +259,27 @@ def train(
 
   policy_optimizer = optax.chain(
     optax.clip(1.0),
-    optax.adam(learning_rate=actor_learning_rate, b1=0.7, b2=0.95)
+    optax.adam(
+      learning_rate=optax.linear_schedule(
+        init_value=actor_learning_rate,
+        end_value=1e-5,
+        transition_steps=num_training_steps_per_epoch * num_evals_after_init,
+      ),
+      b1=0.7,
+      b2=0.95
+    )
   )
   value_optimizer = optax.chain(
     optax.clip(1.0),
-    optax.adam(learning_rate=critic_learning_rate, b1=0.7, b2=0.95)
+    optax.adam(
+      learning_rate=optax.linear_schedule(
+        init_value=critic_learning_rate,
+        end_value=1e-5,
+        transition_steps=num_training_steps_per_epoch * num_evals_after_init * num_updates_per_batch,
+      ),
+      b1=0.7,
+      b2=0.95
+    )
   )
 
   value_loss_fn = functools.partial(
@@ -264,10 +288,12 @@ def train(
       discounting=discounting,
       reward_scaling=reward_scaling,
       lambda_=lambda_,
-      td_lambda=td_lambda)
+      td_lambda=td_lambda
+  )
 
   value_gradient_update_fn = gradients.gradient_update_fn(
-      value_loss_fn, value_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
+      value_loss_fn, value_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+  )
 
   policy_loss_fn = functools.partial(
       shac_losses.compute_shac_policy_loss,
@@ -313,26 +339,22 @@ def train(
     return loss, (state, data, metrics)
 
   policy_gradient_update_fn = gradients.gradient_update_fn(
-      rollout_loss_fn, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
-  policy_gradient_update_fn = jax.jit(policy_gradient_update_fn)
-
-
-  metrics_aggregator = metric_logger.EpisodeMetricsLogger(
-      steps_between_logging=training_metrics_steps
-      or env_step_per_training_step,
-      progress_fn=progress_fn,
+      rollout_loss_fn, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
+  policy_gradient_update_fn = jax.jit(policy_gradient_update_fn)
 
   def minibatch_step(
       carry,
       data: types.Transition,
-      normalizer_params: running_statistics.RunningStatisticsState
+      normalizer_params: running_statistics.RunningStatisticsState,
+      target_value_params: Params,
   ):
     optimizer_state, params, key = carry
     key, key_loss = jax.random.split(key)
     (_, metrics), params, optimizer_state = value_gradient_update_fn(
         params,
         normalizer_params,
+        target_value_params,
         data,
         optimizer_state=optimizer_state
     )
@@ -343,7 +365,8 @@ def train(
       carry,
       unused_t,
       data: types.Transition,
-      normalizer_params: running_statistics.RunningStatisticsState
+      normalizer_params: running_statistics.RunningStatisticsState,
+      target_value_params: Params,
   ):
     optimizer_state, params, key = carry
     key, key_perm, key_grad = jax.random.split(key, 3)
@@ -355,10 +378,15 @@ def train(
 
     shuffled_data = jax.tree_util.tree_map(convert_data, data)
     (optimizer_state, params, _), metrics = jax.lax.scan(
-        functools.partial(minibatch_step, normalizer_params=normalizer_params),
+        functools.partial(
+          minibatch_step,
+          normalizer_params=normalizer_params,
+          target_value_params=target_value_params
+        ),
         (optimizer_state, params, key_grad),
         shuffled_data,
-        length=num_minibatches)
+        length=num_minibatches
+    )
     return (optimizer_state, params, key), metrics
 
   def training_step(
@@ -368,25 +396,37 @@ def train(
     key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
 
     (policy_loss, (state, data, policy_metrics)), policy_params, policy_optimizer_state = policy_gradient_update_fn(
-        training_state.policy_params, training_state.target_value_params,
-        training_state.normalizer_params, state, key_generate_unroll,
-        optimizer_state=training_state.policy_optimizer_state)
+        training_state.policy_params,
+        training_state.target_value_params,
+        training_state.normalizer_params,
+        state,
+        key_generate_unroll,
+        optimizer_state=training_state.policy_optimizer_state
+    )
 
     # Update normalization params and normalize observations.
     normalizer_params = running_statistics.update(
         training_state.normalizer_params,
         data.observation,
-        pmap_axis_name=_PMAP_AXIS_NAME)
+        pmap_axis_name=_PMAP_AXIS_NAME
+    )
 
     (value_optimizer_state, value_params, _), metrics = jax.lax.scan(
         functools.partial(
-            critic_sgd_step, data=data, normalizer_params=normalizer_params),
+            critic_sgd_step,
+            data=data,
+            normalizer_params=normalizer_params,
+            target_value_params=training_state.target_value_params,
+        ),
         (training_state.value_optimizer_state, training_state.value_params, key_sgd), (),
-        length=num_updates_per_batch)
+        length=num_updates_per_batch
+    )
 
     target_value_params = jax.tree_util.tree_map(
-        lambda x, y: x * (1 - tau) + y * tau, training_state.target_value_params,
-        value_params)
+        lambda x, y: x * alpha + y * (1 - alpha),
+        training_state.target_value_params,
+        value_params
+    )
 
     metrics.update(policy_metrics)
 
@@ -396,7 +436,7 @@ def train(
         value_optimizer_state=value_optimizer_state,
         value_params=value_params,
         target_value_params=target_value_params,
-        normalizer_params=training_state.normalizer_params,
+        normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step
     )
     return (new_training_state, state, new_key), metrics
@@ -421,8 +461,7 @@ def train(
   ) -> Tuple[TrainingState, envs.State, Metrics]:
     nonlocal training_walltime
     t = time.time()
-    (training_state, env_state,
-     metrics) = training_epoch(training_state, env_state, key)
+    (training_state, env_state, metrics) = training_epoch(training_state, env_state, key)
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
     jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
 
@@ -471,8 +510,8 @@ def train(
     logging.info('Restoring TrainingState from `restore_params`.')
     value_params = restore_params[2] if restore_value_fn else value_init_params.value
     training_state = training_state.replace(
-        normalizer_params=params[0],
-        policy_params=params[1],
+        normalizer_params=restore_params[0],
+        policy_params=restore_params[1],
         value_params=value_params,
     )
 

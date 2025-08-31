@@ -45,6 +45,7 @@ from mujoco_playground.config import locomotion_params
 from mujoco_playground.config import manipulation_params
 import tensorboardX
 import wandb
+from flax import linen
 
 
 xla_flags = os.environ.get("XLA_FLAGS", "")
@@ -54,7 +55,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["MUJOCO_GL"] = "egl"
 
 # Ignore the info logs from brax
-logging.set_verbosity(logging.WARNING)
+logging.set_verbosity(logging.INFO)
 
 # Suppress warnings
 
@@ -177,47 +178,85 @@ _TD_LAMBDA = flags.DEFINE_boolean(
 
 def get_rl_config(env_name: str) -> config_dict.ConfigDict:
   from ml_collections import config_dict
-  from mujoco_playground._src import locomotion
+  from mujoco_playground._src import locomotion, dm_control_suite
 
-  assert env_name == "G1JoystickFlatTerrain"
-  env_config = locomotion.get_default_config(env_name)
-  rl_config = config_dict.create(
-      num_timesteps=100_000_000,
-      num_evals=10,
-      reward_scaling=1.0,
-      episode_length=env_config.episode_length,
-      normalize_observations=True,
-      action_repeat=1,
-      unroll_length=20,
-      num_minibatches=32,
-      num_updates_per_batch=4,
-      discounting=0.97,
-      actor_learning_rate=3e-4,
-      critic_learning_rate=3e-4,
-      entropy_cost=1e-2,
-      num_envs=8192,
-      batch_size=256,
-      # SHAC specific parameters
-      tau=0.005,  # 1-alpha from the original paper
-      lambda_=0.95,  # GAE lambda parameter
-      td_lambda=True,  # Use TD(lambda) for critic updates
-      num_resets_per_eval=1,  # Number of resets per evaluation
-      network_factory=config_dict.create(
-          policy_hidden_layer_sizes=(128, 128, 128, 128),
-          value_hidden_layer_sizes=(256, 256, 256, 256, 256),
-          policy_obs_key="state",
-          value_obs_key="state",
-      ),
-  )
-  rl_config.num_timesteps = 200_000_000
-  rl_config.num_evals = 20
-  rl_config.entropy_cost = 0.005
-  rl_config.network_factory = config_dict.create(
-      policy_hidden_layer_sizes=(512, 256, 128),
-      value_hidden_layer_sizes=(512, 256, 128),
-      policy_obs_key="state",
-      value_obs_key="privileged_state",
-  )
+  if env_name == "G1JoystickFlatTerrain":
+    env_config = locomotion.get_default_config(env_name)
+    rl_config = config_dict.create(
+        num_timesteps=100_000_000,
+        num_evals=10,
+        reward_scaling=1.0,
+        episode_length=env_config.episode_length,
+        normalize_observations=True,
+        action_repeat=1,
+        unroll_length=20,
+        num_minibatches=32,
+        num_updates_per_batch=4,
+        discounting=0.97,
+        actor_learning_rate=3e-4,
+        critic_learning_rate=3e-4,
+        entropy_cost=1e-2,
+        num_envs=8192,
+        batch_size=256,
+        # SHAC specific parameters
+        tau=0.005,  # 1-alpha from the original paper
+        lambda_=0.95,  # GAE lambda parameter
+        td_lambda=True,  # Use TD(lambda) for critic updates
+        num_resets_per_eval=1,  # Number of resets per evaluation
+        network_factory=config_dict.create(
+            policy_hidden_layer_sizes=(128, 128, 128, 128),
+            value_hidden_layer_sizes=(256, 256, 256, 256, 256),
+            policy_obs_key="state",
+            value_obs_key="state",
+        ),
+    )
+    rl_config.num_timesteps = 200_000_000
+    rl_config.num_evals = 20
+    rl_config.entropy_cost = 0.005
+    rl_config.network_factory = config_dict.create(
+        policy_hidden_layer_sizes=(512, 256, 128),
+        value_hidden_layer_sizes=(512, 256, 128),
+        policy_obs_key="state",
+        value_obs_key="privileged_state",
+    )
+  elif env_name == "CartpoleBalance":
+    env_config = dm_control_suite.get_default_config(env_name)
+    rl_config = config_dict.create(
+        num_timesteps=60_000_000, # 5000 episodes
+        num_evals=500, # evaluation number (epoch)
+        num_eval_envs=64,
+        num_resets_per_eval=1,  # Number of resets per evaluation
+
+        reward_scaling=1.0,
+        episode_length=env_config.episode_length,
+        normalize_observations=True,
+        action_repeat=1,
+
+        # training configuration
+        num_envs=64,
+        unroll_length=32, # rollout length per policy, short horizon length
+        num_updates_per_batch=16, # update number of critic
+        num_minibatches=4, # number of minibatches when per critic update
+        # minibatch_size = num_envs * unroll_length // num_minibatches
+        batch_size=512, # minibatch_size
+
+        discounting=0.99,
+        actor_learning_rate=0.01,
+        critic_learning_rate=0.001,
+        entropy_cost=1e-2,
+
+        alpha=0.2,
+        lambda_=0.95,  # GAE lambda parameter
+        td_lambda=True,  # Use TD(lambda) for critic updates
+    )
+    rl_config.network_factory = config_dict.create(
+        policy_hidden_layer_sizes=(64, 64),
+        value_hidden_layer_sizes=(64, 64),
+        # activation=linen.elu,
+    )
+  else:
+    raise ValueError(f"not implemented {env_name}")
+
   return rl_config
 
 
@@ -329,7 +368,7 @@ def main(argv):
 
   # Initialize Weights & Biases if required
   if _USE_WANDB.value and not _PLAY_ONLY.value:
-    wandb.init(project="mjxrl", entity="dextrm", name=exp_name)
+    wandb.init(project="mjxrl", entity="froggagul", name=exp_name)
     wandb.config.update(env_cfg.to_dict())
     wandb.config.update({"env_name": _ENV_NAME.value})
 
@@ -393,7 +432,7 @@ def main(argv):
       seed=_SEED.value,
       restore_checkpoint_path=restore_checkpoint_path,
       save_checkpoint_path=ckpt_path,
-      wrap_env_fn=None if _VISION.value else wrapper.wrap_for_brax_training,
+      wrap_env_fn=wrapper.wrap_for_brax_training,
       num_eval_envs=num_eval_envs,
   )
 
@@ -523,7 +562,7 @@ def main(argv):
   #     return next_state.reward
 
   #   action = jit_inference_fn(state.obs, rng)[0]
-  #   grad_fn = jax.jacfwd(reward_fn)
+  #   grad_fn = jax.grad(reward_fn)
   #   action_grad = grad_fn(action)
   #   return action, action_grad
 
@@ -534,6 +573,15 @@ def main(argv):
   # breakpoint()
 
   # Render and save the rollout.
+  traj_stacked = jax.jit(jax.vmap(do_rollout))(rng, reset_states)
+  trajectories = [None] * _NUM_VIDEOS.value
+  for i in range(_NUM_VIDEOS.value):
+    t = jax.tree.map(lambda x, i=i: x[i], traj_stacked)
+    trajectories[i] = [
+        jax.tree.map(lambda x, j=j: x[j], t)
+        for j in range(_EPISODE_LENGTH.value)
+    ]
+
   render_every = 2
   fps = 1.0 / eval_env.dt / render_every
   print(f"FPS for rendering: {fps}")
@@ -544,10 +592,10 @@ def main(argv):
   for i, rollout in enumerate(trajectories):
     traj = rollout[::render_every]
     frames = eval_env.render(
-        traj, height=480, width=640, scene_option=scene_option, camera="track",
+        traj, height=480, width=640, scene_option=scene_option, camera="lookatcart",
     )
     media.write_video(f"shac_rollout{i}.mp4", frames, fps=fps)
-    print(f"Rollout video saved as 'rollout{i}.mp4'.")
+    print(f"Rollout video saved as 'shac_rollout{i}.mp4'.")
 
 
 if __name__ == "__main__":

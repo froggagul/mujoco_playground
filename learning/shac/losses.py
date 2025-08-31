@@ -95,15 +95,21 @@ def compute_shac_policy_loss(
 
   rew_acc = jnp.zeros_like(terminal_values)
   gam = jnp.ones_like(terminal_values)
-  (gam, last_rew_acc), (gam_acc, rew_acc) = jax.lax.scan(sum_step, (gam, rew_acc),
-      (rewards, termination))
+  (gam, last_rew_acc), (gam_acc, rew_acc) = jax.lax.scan(
+    sum_step,
+    (gam, rew_acc),
+    (rewards, termination)
+  )
 
   policy_loss = jnp.sum(-last_rew_acc - gam * terminal_values)
   # for trials that are truncated (i.e. hit the episode length) include reward for
   # terminal state. otherwise, the trial was aborted and should receive zero additional
-  policy_loss = policy_loss + jnp.sum((-rew_acc - gam_acc * jnp.where(truncation, values_t_plus_1, 0)) * termination)
+  # policy_loss = policy_loss + jnp.sum(
+  #   (-rew_acc - gam_acc * jnp.where(truncation, values_t_plus_1, 0)) * termination)
+  policy_loss = policy_loss + jnp.sum(
+    (-rew_acc - gam_acc * values_t_plus_1) * truncation
+  )
   policy_loss = policy_loss / values.shape[0] / values.shape[1]
-
 
   # Entropy reward
   policy_logits = policy_apply(normalizer_params, policy_params,
@@ -122,18 +128,21 @@ def compute_shac_policy_loss(
 def compute_shac_critic_loss(
     params: Params,
     normalizer_params: Any,
+    target_value_params: Params,
     data: types.Transition,
     shac_network: shac_networks.SHACNetworks,
     discounting: float = 0.9,
     reward_scaling: float = 1.0,
     lambda_: float = 0.95,
-    td_lambda: bool = True) -> Tuple[jnp.ndarray, types.Metrics]:
+    td_lambda: bool = True
+) -> Tuple[jnp.ndarray, types.Metrics]:
   """Computes SHAC critic loss.
   This implements Eq. 7 of 2204.07137
   https://github.com/NVlabs/DiffRL/blob/main/algorithms/shac.py#L349
   Args:
     params: Value network parameters,
     normalizer_params: Parameters of the normalizer.
+    target_value_params: Target value network parameters.
     data: Transition that with leading dimension [B, T]. extra fields required
       are ['state_extras']['truncation'] ['policy_extras']['raw_action']
         ['policy_extras']['log_prob']
@@ -151,55 +160,46 @@ def compute_shac_critic_loss(
   value_apply = shac_network.value_network.apply
 
   data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
+  T, B = data.reward.shape[:2]
 
-  values = value_apply(normalizer_params, params, data.observation)
-  # terminal_value = value_apply(normalizer_params, params, data.next_observation[-1])
-  terminal_obs = jax.tree_util.tree_map(lambda x: x[-1], data.next_observation)
-  terminal_value = value_apply(normalizer_params, params, terminal_obs)
+  v_pred = value_apply(normalizer_params, params, data.observation)
+  v_tp1_all = value_apply(normalizer_params, target_value_params, data.next_observation)
+  # Rewards & masks
+  rew = data.reward * reward_scaling
+  trunc = data.extras['state_extras']['truncation'].astype(bool)   # time-limit
+  # termination: true end of episode (not time-limit). Requires discount∈{0,1}.
+  term = ((1.0 - data.discount) * (1.0 - trunc.astype(v_pred.dtype))).astype(bool)
 
-  rewards = data.reward * reward_scaling
-  truncation = data.extras['state_extras']['truncation']
-  termination = (1 - data.discount) * (1 - truncation)
+  # Mask bootstrap at true terminations; allow at truncations and normal steps
+  v_tp1_masked = jnp.where(term, 0.0, v_tp1_all)  # [T, B]
 
-  # Append terminal values to get [v1, ..., v_t+1]
-  values_t_plus_1 = jnp.concatenate(
-      [values[1:], jnp.expand_dims(terminal_value, 0)], axis=0)
-
-  # compute target values
   if td_lambda:
+    # Standard TD(λ) backward recursion:
+    #   G_t = r_t + γ * [ (1-λ) V_{t+1} + λ G_{t+1} ], with G_t = r_t if termination.
+    def step(g_tp1, x):
+      r_t, v_tp1_t, term_t = x
+      # When term_t, the bootstrap term is zero
+      mix = (1.0 - lambda_) * v_tp1_t + lambda_ * g_tp1
+      g_t = r_t + discounting * jnp.where(term_t, 0.0, mix)
+      return g_t, g_t
 
-    def compute_v_st(carry, target_t):
-      Ai, Bi, lam = carry
-      reward, vtp1, termination = target_t
-
-      reward = reward * termination
-
-      lam = lam * lambda_ * (1 - termination) + termination
-      Ai = (1 - termination) * (lam * discounting * Ai + discounting * vtp1 + (1. - lam) / (1. - lambda_) * reward)
-      Bi = discounting * (vtp1 * termination + Bi * (1.0 - termination)) + reward
-      vs = (1.0 - lambda_) * Ai + lam * Bi
-
-      return (Ai, Bi, lam), (vs)
-
-    Ai = jnp.ones_like(terminal_value)
-    Bi = jnp.zeros_like(terminal_value)
-    lam = jnp.ones_like(terminal_value)
-    (_, _, _), (vs) = jax.lax.scan(compute_v_st, (Ai, Bi, lam),
-        (rewards, values_t_plus_1, termination),
-        length=int(termination.shape[0]),
+    g_T = jnp.zeros((B,), v_pred.dtype)
+    _, g_seq = jax.lax.scan(
+        step,
+        g_T,
+        (rew, v_tp1_masked, term),
         reverse=True)
-
+    target_values = jax.lax.stop_gradient(g_seq)          # [T, B]
   else:
-    vs = rewards + discounting * values_t_plus_1
+    # One-step TD: V^target_t = r_t + γ * V_{t+1}; zero out on true terminations
+    target_values = rew + discounting * v_tp1_masked
+    target_values = jax.lax.stop_gradient(target_values)
 
-  target_values = jax.lax.stop_gradient(vs)
+  v_loss = jnp.mean((target_values - v_pred) ** 2)
 
-  v_loss = jnp.mean((target_values - values) ** 2)
-
-  total_loss = v_loss
-  return total_loss, {
-      'total_loss': total_loss,
-      'policy_loss': 0,
+  return v_loss, {
+      'total_loss': v_loss,
+      'policy_loss': jnp.array(0.0),
       'v_loss': v_loss,
-      'entropy_loss': 0
+      'entropy_loss': jnp.array(0.0),
   }
