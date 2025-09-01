@@ -200,7 +200,7 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
         batch_size=256,
         # SHAC specific parameters
         tau=0.005,  # 1-alpha from the original paper
-        lambda_=0.95,  # GAE lambda parameter
+        lambda_=0.85,  # GAE lambda parameter
         td_lambda=True,  # Use TD(lambda) for critic updates
         num_resets_per_eval=1,  # Number of resets per evaluation
         network_factory=config_dict.create(
@@ -223,11 +223,11 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
     env_config = dm_control_suite.get_default_config(env_name)
     rl_config = config_dict.create(
         num_timesteps=60_000_000, # 5000 episodes
-        num_evals=500, # evaluation number (epoch)
+        num_evals=1000, # evaluation number (epoch)
         num_eval_envs=64,
-        num_resets_per_eval=1,  # Number of resets per evaluation
+        num_resets_per_eval=0,  # Number of resets per evaluation
 
-        reward_scaling=1.0,
+        reward_scaling=10.0,
         episode_length=env_config.episode_length,
         normalize_observations=True,
         action_repeat=1,
@@ -238,15 +238,15 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
         num_updates_per_batch=16, # update number of critic
         num_minibatches=4, # number of minibatches when per critic update
         # minibatch_size = num_envs * unroll_length // num_minibatches
-        batch_size=512, # minibatch_size
+        batch_size=64, # minibatch_size
 
         discounting=0.99,
-        actor_learning_rate=0.01,
-        critic_learning_rate=0.001,
-        entropy_cost=1e-2,
+        actor_learning_rate=0.001,
+        critic_learning_rate=0.0,
+        entropy_cost=0.0,
 
         alpha=0.2,
-        lambda_=0.95,  # GAE lambda parameter
+        lambda_=0.95,  # TD lambda parameter
         td_lambda=True,  # Use TD(lambda) for critic updates
     )
     rl_config.network_factory = config_dict.create(
