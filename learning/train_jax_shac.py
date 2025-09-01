@@ -235,10 +235,10 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
         # training configuration
         num_envs=64,
         unroll_length=32, # rollout length per policy, short horizon length
-        num_updates_per_batch=16, # update number of critic
-        num_minibatches=4, # number of minibatches when per critic update
-        # minibatch_size = num_envs * unroll_length // num_minibatches
-        batch_size=64, # minibatch_size
+        batch_size=256, # batch_size
+
+        num_critic_update=16, # update number of critic
+        num_critic_minibatch_per_update=4, # number of minibatches when per critic update
 
         discounting=0.99,
         actor_learning_rate=0.001,

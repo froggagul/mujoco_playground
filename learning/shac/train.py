@@ -138,8 +138,10 @@ def train(
     discounting: float = 0.9,
     unroll_length: int = 10,
     batch_size: int = 32,
-    num_minibatches: int = 16,
-    num_updates_per_batch: int = 2,
+
+    num_critic_update: int = 16,
+    num_critic_minibatch_per_update: int = 4,
+
     num_resets_per_eval: int = 0,
     normalize_observations: bool = False,
 
@@ -173,7 +175,7 @@ def train(
     run_evals: bool = True,
 ):
   """SHAC training."""
-  assert batch_size * num_minibatches % num_envs == 0
+  assert batch_size % num_envs == 0, "batch size should be divided by num_envs"
   xt = time.time()
 
   process_count = jax.process_count()
@@ -183,30 +185,31 @@ def train(
   if max_devices_per_host:
     local_devices_to_use = min(local_devices_to_use, max_devices_per_host)
   logging.info(
-      'Device count: %d, process count: %d (id %d), local device count: %d, '
-      'devices to be used count: %d',
-      jax.device_count(),
-      process_count,
-      process_id,
-      local_device_count,
-      local_devices_to_use,
+    'Device count: %d, process count: %d (id %d), local device count: %d, '
+    'devices to be used count: %d',
+    jax.device_count(),
+    process_count,
+    process_id,
+    local_device_count,
+    local_devices_to_use,
   )
   device_count = local_devices_to_use * process_count
 
-  # The number of environment steps executed for every training step.
+  # The number of environment steps (samples) executed for every training step.
   env_step_per_training_step = (
-      batch_size * unroll_length * num_minibatches * action_repeat)
+    batch_size * unroll_length * action_repeat
+  )
   num_evals_after_init = max(num_evals - 1, 1)
   # The number of training_step calls per training_epoch call.
   # equals to ceil(num_timesteps / (num_evals * env_step_per_training_step *
   #                                 num_resets_per_eval))
   num_training_steps_per_epoch = np.ceil(
-      num_timesteps
-      / (
-          num_evals_after_init
-          * env_step_per_training_step
-          * max(num_resets_per_eval, 1)
-      )
+    num_timesteps
+    / (
+      num_evals_after_init
+      * env_step_per_training_step
+      * max(num_resets_per_eval, 1)
+    )
   ).astype(int)
   print("num_timesteps:", num_timesteps)
   print("env_step_per_training_step:", env_step_per_training_step)
@@ -225,15 +228,15 @@ def train(
   assert num_envs % device_count == 0
 
   env = _maybe_wrap_env(
-      environment,
-      wrap_env,
-      num_envs,
-      episode_length,
-      action_repeat,
-      device_count,
-      key_env,
-      wrap_env_fn,
-      randomization_fn,
+    environment,
+    wrap_env,
+    num_envs,
+    episode_length,
+    action_repeat,
+    device_count,
+    key_env,
+    wrap_env_fn,
+    randomization_fn,
   )
 
   if local_devices_to_use > 1 or use_pmap_on_reset:
@@ -285,46 +288,32 @@ def train(
   )
 
   value_loss_fn = functools.partial(
-      shac_losses.compute_shac_critic_loss,
-      shac_network=shac_network,
-      discounting=discounting,
-      reward_scaling=reward_scaling,
-      lambda_=lambda_,
-      td_lambda=td_lambda
+    shac_losses.compute_shac_critic_loss,
+    shac_network=shac_network,
+    discounting=discounting,
+    reward_scaling=reward_scaling,
+    lambda_=lambda_,
+    td_lambda=td_lambda
   )
 
   value_gradient_update_fn = gradients.gradient_update_fn(
-      value_loss_fn, value_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+    value_loss_fn, value_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
 
   policy_loss_fn = functools.partial(
-      shac_losses.compute_shac_policy_loss,
-      shac_network=shac_network,
-      entropy_cost=entropy_cost,
-      discounting=discounting,
-      reward_scaling=reward_scaling)
+    shac_losses.compute_shac_policy_loss,
+    shac_network=shac_network,
+    entropy_cost=entropy_cost,
+    discounting=discounting,
+    reward_scaling=reward_scaling
+  )
 
   def rollout_loss_fn(policy_params, value_params, normalizer_params, state, key):
     policy = make_policy((
-        normalizer_params,
-        policy_params,
-        value_params,
+      normalizer_params,
+      policy_params,
+      value_params,
     ))
-    # def test_grad(pi_params, key):
-    #   policy_from_pi = make_policy((normalizer_params, pi_params, value_params))
-    #   next_state, data = acting.generate_unroll(
-    #       env,
-    #       state,
-    #       policy_from_pi,
-    #       key,
-    #       unroll_length,
-    #       extra_fields=('truncation',))
-    #   return jnp.sum(data.reward)
-
-    # g = jax.grad(test_grad)(policy_params, jax.random.PRNGKey(0))
-    # j = jax.tree_util.tree_reduce(lambda a,b: a + jnp.sum(jnp.abs(b)), g, 0.0)
-    # jax.debug.print("||∇θ J|| = {j}", j=j)
-    # jax.debug.breakpoint()
 
     key, key_loss = jax.random.split(key)
 
@@ -332,120 +321,131 @@ def train(
       current_state, current_key = carry
       current_key, next_key = jax.random.split(current_key)
       next_state, data = acting.generate_unroll(
-          env,
-          current_state,
-          policy,
-          current_key,
-          unroll_length,
-          extra_fields=('truncation',))
+        env,
+        current_state,
+        policy,
+        current_key,
+        unroll_length,
+        extra_fields=('truncation',)
+      )
       return (next_state, next_key), data
 
     (state, _), data = jax.lax.scan(
-        f, (state, key), (),
-        length=batch_size * num_minibatches // num_envs)
+      f, (state, key), (),
+      length=batch_size // num_envs
+    )
 
-    # Have leading dimentions (batch_size * num_minibatches, unroll_length)
-    data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
-    data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
-                                  data)
+    # Have leading dimentions (batch_size, unroll_length)
+    data = jax.tree_util.tree_map(
+      lambda x: jnp.swapaxes(x, 1, 2),
+      data,
+    )
+    data = jax.tree_util.tree_map(
+      lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+      data,
+    )
     assert data.discount.shape[1:] == (unroll_length,)
 
-    loss, metrics = policy_loss_fn(policy_params, value_params,
-        normalizer_params, data, key_loss)
+    loss, metrics = policy_loss_fn(
+      policy_params,
+      value_params,
+      normalizer_params,
+      data,
+      key_loss
+    )
 
     return loss, (state, data, metrics)
 
   policy_gradient_update_fn = gradients.gradient_update_fn(
-      rollout_loss_fn, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+    rollout_loss_fn, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
   policy_gradient_update_fn = jax.jit(policy_gradient_update_fn)
 
-  def minibatch_step(
-      carry,
-      data: types.Transition,
-      normalizer_params: running_statistics.RunningStatisticsState,
-      target_value_params: Params,
+  def critic_update_minibatch_step(
+    carry,
+    data: types.Transition,
+    normalizer_params: running_statistics.RunningStatisticsState,
+    target_value_params: Params,
   ):
     optimizer_state, params, key = carry
     key, key_loss = jax.random.split(key)
     (_, metrics), params, optimizer_state = value_gradient_update_fn(
-        params,
-        normalizer_params,
-        target_value_params,
-        data,
-        optimizer_state=optimizer_state
+      params,
+      normalizer_params,
+      target_value_params,
+      data,
+      optimizer_state=optimizer_state
     )
-    # jax.debug.print("metrics={metrics}",metrics=metrics['critic/ev'])
 
     return (optimizer_state, params, key), metrics
 
-  def critic_sgd_step(
-      carry,
-      unused_t,
-      data: types.Transition,
-      normalizer_params: running_statistics.RunningStatisticsState,
-      target_value_params: Params,
+  def critic_update(
+    carry,
+    unused_t,
+    data: types.Transition,
+    normalizer_params: running_statistics.RunningStatisticsState,
+    target_value_params: Params,
   ):
     optimizer_state, params, key = carry
     key, key_perm, key_grad = jax.random.split(key, 3)
 
     def convert_data(x: jnp.ndarray):
       x = jax.random.permutation(key_perm, x)
-      x = jnp.reshape(x, (num_minibatches, -1) + x.shape[1:])
+      x = jnp.reshape(x, (num_critic_minibatch_per_update, -1) + x.shape[1:])
       return x
 
     shuffled_data = jax.tree_util.tree_map(convert_data, data)
     (optimizer_state, params, _), metrics = jax.lax.scan(
-        functools.partial(
-          minibatch_step,
-          normalizer_params=normalizer_params,
-          target_value_params=target_value_params
-        ),
-        (optimizer_state, params, key_grad),
-        shuffled_data,
-        length=num_minibatches
+      functools.partial(
+        critic_update_minibatch_step,
+        normalizer_params=normalizer_params,
+        target_value_params=target_value_params
+      ),
+      (optimizer_state, params, key_grad),
+      shuffled_data,
+      length=num_critic_minibatch_per_update
     )
     return (optimizer_state, params, key), metrics
 
   def training_step(
-      carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
+    carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
   ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
     training_state, state, key = carry
     key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
 
     (policy_loss, (state, data, policy_metrics)), policy_params, policy_optimizer_state = policy_gradient_update_fn(
-        training_state.policy_params,
-        training_state.target_value_params,
-        training_state.normalizer_params,
-        state,
-        key_generate_unroll,
-        optimizer_state=training_state.policy_optimizer_state
+      training_state.policy_params,
+      training_state.target_value_params,
+      training_state.normalizer_params,
+      state,
+      key_generate_unroll,
+      optimizer_state=training_state.policy_optimizer_state
     )
     # jax.debug.breakpoint()
 
     # Update normalization params and normalize observations.
     normalizer_params = running_statistics.update(
-        training_state.normalizer_params,
-        data.observation,
-        pmap_axis_name=_PMAP_AXIS_NAME
+      training_state.normalizer_params,
+      data.observation,
+      pmap_axis_name=_PMAP_AXIS_NAME
     )
     # normalizer_params = training_state.normalizer_params
 
     (value_optimizer_state, value_params, _), metrics = jax.lax.scan(
-        functools.partial(
-            critic_sgd_step,
-            data=data,
-            normalizer_params=normalizer_params,
-            target_value_params=training_state.target_value_params,
-        ),
-        (training_state.value_optimizer_state, training_state.value_params, key_sgd), (),
-        length=num_updates_per_batch
+      functools.partial(
+        critic_update,
+        data=data,
+        normalizer_params=normalizer_params,
+        target_value_params=training_state.target_value_params,
+      ),
+      (training_state.value_optimizer_state, training_state.value_params, key_sgd), (),
+      length=num_critic_update
     )
 
     target_value_params = jax.tree_util.tree_map(
-        lambda x, y: x * alpha + y * (1 - alpha),
-        training_state.target_value_params,
-        value_params
+      lambda x, y: x * alpha + y * (1 - alpha),
+      training_state.target_value_params,
+      value_params
     )
     # value_optimizer_state = training_state.value_optimizer_state
     # target_value_params = training_state.value_params
@@ -453,13 +453,13 @@ def train(
     metrics.update(policy_metrics)
 
     new_training_state = TrainingState(
-        policy_optimizer_state=policy_optimizer_state,
-        policy_params=policy_params,
-        value_optimizer_state=value_optimizer_state,
-        value_params=value_params,
-        target_value_params=target_value_params,
-        normalizer_params=normalizer_params,
-        env_steps=training_state.env_steps + env_step_per_training_step
+      policy_optimizer_state=policy_optimizer_state,
+      policy_params=policy_params,
+      value_optimizer_state=value_optimizer_state,
+      value_params=value_params,
+      target_value_params=target_value_params,
+      normalizer_params=normalizer_params,
+      env_steps=training_state.env_steps + env_step_per_training_step
     )
     return (new_training_state, state, new_key), metrics
 
@@ -467,10 +467,10 @@ def train(
       training_state: TrainingState, state: envs.State, key: PRNGKey
   ) -> Tuple[TrainingState, envs.State, Metrics]:
     (training_state, state, _), loss_metrics = jax.lax.scan(
-        training_step,
-        (training_state, state, key),
-        (),
-        length=num_training_steps_per_epoch
+      training_step,
+      (training_state, state, key),
+      (),
+      length=num_training_steps_per_epoch
     )
     loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)
     return training_state, state, loss_metrics
@@ -479,7 +479,7 @@ def train(
 
   # Note that this is NOT a pure jittable method.
   def training_epoch_with_timing(
-      training_state: TrainingState, env_state: envs.State, key: PRNGKey
+    training_state: TrainingState, env_state: envs.State, key: PRNGKey
   ) -> Tuple[TrainingState, envs.State, Metrics]:
     nonlocal training_walltime
     t = time.time()
@@ -490,14 +490,14 @@ def train(
     epoch_training_time = time.time() - t
     training_walltime += epoch_training_time
     sps = (
-        num_training_steps_per_epoch
-        * env_step_per_training_step
-        * max(num_resets_per_eval, 1)
+      num_training_steps_per_epoch
+      * env_step_per_training_step
+      * max(num_resets_per_eval, 1)
     ) / epoch_training_time
     metrics = {
-        'training/sps': sps,
-        'training/walltime': training_walltime,
-        **{f'training/{name}': value for name, value in metrics.items()}
+      'training/sps': sps,
+      'training/walltime': training_walltime,
+      **{f'training/{name}': value for name, value in metrics.items()}
     }
     return training_state, env_state, metrics
 
@@ -505,7 +505,7 @@ def train(
   value_init_params = shac_network.value_network.init(key_value)
 
   obs_shape = jax.tree_util.tree_map(
-      lambda x: specs.Array(x.shape[-1:], jnp.dtype('float32')), env_state.obs
+    lambda x: specs.Array(x.shape[-1:], jnp.dtype('float32')), env_state.obs
   )
   training_state = TrainingState(
       policy_optimizer_state=policy_optimizer.init(policy_init_params),
