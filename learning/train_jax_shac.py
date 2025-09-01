@@ -242,7 +242,7 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
 
         discounting=0.99,
         actor_learning_rate=0.001,
-        critic_learning_rate=0.0,
+        critic_learning_rate=0.001,
         entropy_cost=0.0,
 
         alpha=0.2,

@@ -260,11 +260,12 @@ def train(
   policy_optimizer = optax.chain(
     optax.clip(1.0),
     optax.adam(
-      learning_rate=optax.linear_schedule(
-        init_value=actor_learning_rate,
-        end_value=1e-5,
-        transition_steps=num_training_steps_per_epoch * num_evals_after_init,
-      ),
+      learning_rate=actor_learning_rate,
+      # optax.linear_schedule(
+      #   init_value=actor_learning_rate,
+      #   end_value=1e-5,
+      #   transition_steps=num_training_steps_per_epoch * num_evals_after_init,
+      # ),
       b1=0.7,
       b2=0.95
     )
@@ -272,11 +273,12 @@ def train(
   value_optimizer = optax.chain(
     optax.clip(1.0),
     optax.adam(
-      learning_rate=optax.linear_schedule(
-        init_value=critic_learning_rate,
-        end_value=1e-5,
-        transition_steps=num_training_steps_per_epoch * num_evals_after_init * num_updates_per_batch,
-      ),
+      learning_rate=critic_learning_rate,
+      # optax.linear_schedule(
+      #   init_value=critic_learning_rate,
+      #   end_value=1e-5,
+      #   transition_steps=num_training_steps_per_epoch * num_evals_after_init * num_updates_per_batch,
+      # ),
       b1=0.7,
       b2=0.95
     )
@@ -308,6 +310,21 @@ def train(
         policy_params,
         value_params,
     ))
+    # def test_grad(pi_params, key):
+    #   policy_from_pi = make_policy((normalizer_params, pi_params, value_params))
+    #   next_state, data = acting.generate_unroll(
+    #       env,
+    #       state,
+    #       policy_from_pi,
+    #       key,
+    #       unroll_length,
+    #       extra_fields=('truncation',))
+    #   return jnp.sum(data.reward)
+
+    # g = jax.grad(test_grad)(policy_params, jax.random.PRNGKey(0))
+    # j = jax.tree_util.tree_reduce(lambda a,b: a + jnp.sum(jnp.abs(b)), g, 0.0)
+    # jax.debug.print("||∇θ J|| = {j}", j=j)
+    # jax.debug.breakpoint()
 
     key, key_loss = jax.random.split(key)
 
@@ -358,6 +375,7 @@ def train(
         data,
         optimizer_state=optimizer_state
     )
+    # jax.debug.print("metrics={metrics}",metrics=metrics['critic/ev'])
 
     return (optimizer_state, params, key), metrics
 
@@ -403,6 +421,7 @@ def train(
         key_generate_unroll,
         optimizer_state=training_state.policy_optimizer_state
     )
+    # jax.debug.breakpoint()
 
     # Update normalization params and normalize observations.
     normalizer_params = running_statistics.update(
@@ -410,6 +429,7 @@ def train(
         data.observation,
         pmap_axis_name=_PMAP_AXIS_NAME
     )
+    # normalizer_params = training_state.normalizer_params
 
     (value_optimizer_state, value_params, _), metrics = jax.lax.scan(
         functools.partial(
@@ -427,6 +447,8 @@ def train(
         training_state.target_value_params,
         value_params
     )
+    # value_optimizer_state = training_state.value_optimizer_state
+    # target_value_params = training_state.value_params
 
     metrics.update(policy_metrics)
 
@@ -504,6 +526,7 @@ def train(
         normalizer_params=params[0],
         policy_params=params[1],
         value_params=value_params,
+        target_value_params=value_params,
     )
 
   if restore_params is not None:
@@ -513,6 +536,7 @@ def train(
         normalizer_params=restore_params[0],
         policy_params=restore_params[1],
         value_params=value_params,
+        target_value_params=value_params,
     )
 
   if num_timesteps == 0:
