@@ -197,17 +197,18 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
         unroll_length=32, # rollout length per policy, short horizon length
         batch_size=256, # batch_size
 
-        num_critic_update=4, # update number of critic
-        num_critic_minibatch_per_update=32, # number of minibatches when per critic update
+        num_critic_update=16, # update number of critic
+        num_critic_minibatch_per_update=4, # number of minibatches when per critic update
+
         policy_grad_accum_steps=4,
 
         discounting=0.99,
-        actor_learning_rate=0.002,
-        critic_learning_rate=0.0005,
-        entropy_cost=0.005,
+        actor_learning_rate=0.001,
+        critic_learning_rate=0.0001,
+        entropy_cost=0.001,
 
         # SHAC specific parameters
-        alpha=0.995,
+        alpha=0.9,
         lambda_=0.95,  # GAE lambda parameter
 
         network_factory=config_dict.create(
