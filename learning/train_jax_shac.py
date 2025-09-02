@@ -183,41 +183,39 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
   if env_name == "G1JoystickFlatTerrain":
     env_config = locomotion.get_default_config(env_name)
     rl_config = config_dict.create(
-        num_timesteps=100_000_000,
-        num_evals=10,
+        num_timesteps=200_000_000,
+        num_evals=2000,
+        num_eval_envs=64,
+        num_resets_per_eval=0,
+
         reward_scaling=1.0,
         episode_length=env_config.episode_length,
         normalize_observations=True,
         action_repeat=1,
-        unroll_length=20,
-        num_minibatches=32,
-        num_updates_per_batch=4,
-        discounting=0.97,
-        actor_learning_rate=3e-4,
-        critic_learning_rate=3e-4,
-        entropy_cost=1e-2,
-        num_envs=8192,
-        batch_size=256,
+
+        num_envs=64,
+        unroll_length=32, # rollout length per policy, short horizon length
+        batch_size=256, # batch_size
+
+        num_critic_update=4, # update number of critic
+        num_critic_minibatch_per_update=32, # number of minibatches when per critic update
+        policy_grad_accum_steps=4,
+
+        discounting=0.99,
+        actor_learning_rate=0.002,
+        critic_learning_rate=0.0005,
+        entropy_cost=0.005,
+
         # SHAC specific parameters
-        tau=0.005,  # 1-alpha from the original paper
-        lambda_=0.85,  # GAE lambda parameter
-        td_lambda=True,  # Use TD(lambda) for critic updates
-        num_resets_per_eval=1,  # Number of resets per evaluation
+        alpha=0.995,
+        lambda_=0.95,  # GAE lambda parameter
+
         network_factory=config_dict.create(
-            policy_hidden_layer_sizes=(128, 128, 128, 128),
-            value_hidden_layer_sizes=(256, 256, 256, 256, 256),
-            policy_obs_key="state",
-            value_obs_key="state",
+          policy_hidden_layer_sizes=(512, 256, 128),
+          value_hidden_layer_sizes=(512, 256, 128),
+          policy_obs_key="state",
+          value_obs_key="privileged_state",
         ),
-    )
-    rl_config.num_timesteps = 200_000_000
-    rl_config.num_evals = 20
-    rl_config.entropy_cost = 0.005
-    rl_config.network_factory = config_dict.create(
-        policy_hidden_layer_sizes=(512, 256, 128),
-        value_hidden_layer_sizes=(512, 256, 128),
-        policy_obs_key="state",
-        value_obs_key="privileged_state",
     )
   elif env_name == "CartpoleBalance":
     env_config = dm_control_suite.get_default_config(env_name)
@@ -225,7 +223,7 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
         num_timesteps=60_000_000, # 5000 episodes
         num_evals=1000, # evaluation number (epoch)
         num_eval_envs=64,
-        num_resets_per_eval=0,  # Number of resets per evaluation
+        num_resets_per_eval=1,  # Number of resets per evaluation
 
         reward_scaling=10.0,
         episode_length=env_config.episode_length,
@@ -247,7 +245,6 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
 
         alpha=0.2,
         lambda_=0.95,  # TD lambda parameter
-        td_lambda=True,  # Use TD(lambda) for critic updates
     )
     rl_config.network_factory = config_dict.create(
         policy_hidden_layer_sizes=(64, 64),

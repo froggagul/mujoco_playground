@@ -69,6 +69,15 @@ class TrainingState:
 def _unpmap(v):
   return jax.tree_util.tree_map(lambda x: x[0], v)
 
+def _tree_add(a, b):
+  return jax.tree_util.tree_map(lambda x, y: x + y, a, b)
+
+def _tree_div(a, denom):
+  return jax.tree_util.tree_map(lambda x: x / denom, a)
+
+def _tree_zeros_like(t):
+  return jax.tree_util.tree_map(jnp.zeros_like, t)
+
 def _maybe_wrap_env(
     env: envs.Env,
     wrap_env: bool,
@@ -141,6 +150,7 @@ def train(
 
     num_critic_update: int = 16,
     num_critic_minibatch_per_update: int = 4,
+    policy_grad_accum_steps: int = None,
 
     num_resets_per_eval: int = 0,
     normalize_observations: bool = False,
@@ -211,6 +221,8 @@ def train(
       * max(num_resets_per_eval, 1)
     )
   ).astype(int)
+  policy_grad_accum_steps = int(policy_grad_accum_steps) if policy_grad_accum_steps is not None else 1
+
   print("num_timesteps:", num_timesteps)
   print("env_step_per_training_step:", env_step_per_training_step)
   print("num_training_steps_per_epoch:", num_training_steps_per_epoch)
@@ -356,6 +368,66 @@ def train(
 
     return loss, (state, data, metrics)
 
+  def rollout_loss_grad_accum(
+      policy_params: Params,
+      value_params: Params,
+      normalizer_params: running_statistics.RunningStatisticsState,
+      state: envs.State,
+      key: PRNGKey,
+  ):
+    """Runs accum_steps micro-rollouts, each unrolling `unroll_length` steps,
+    computes policy loss per microbatch, accumulates grads/loss/metrics,
+    and returns averaged (loss, grads, metrics) plus concatenated data."""
+    denom = jnp.asarray(policy_grad_accum_steps, dtype=jnp.float32)
+    def micro_rollout_loss(p: Params, st: envs.State, k: PRNGKey):
+      # policy depends on *current* params so sim grads flow into p
+      policy = make_policy((normalizer_params, p, value_params))
+
+      # rollout one microbatch (num_envs environments for unroll_length steps)
+      k_roll, k_loss = jax.random.split(k)
+      next_state, mb_data = acting.generate_unroll(
+          env, st, policy, k_roll, unroll_length, extra_fields=('truncation',)
+      )
+      # reshape to (batch=num_envs, T=unroll, ...)
+      mb_data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), mb_data)
+
+      # compute policy loss/metrics on this microbatch
+      loss, metrics = policy_loss_fn(p, value_params, normalizer_params, mb_data, k_loss)
+      return loss, (next_state, mb_data, metrics)
+
+    def body(carry, _):
+      st, k, grad_sum, loss_sum = carry
+      k, k_step = jax.random.split(k)
+
+      # v&g through rollout + loss for this microbatch
+      (loss, (next_st, mb_data, metrics)), g = jax.value_and_grad(
+        lambda p: micro_rollout_loss(p, st, k_step), has_aux=True
+      )(policy_params)
+
+      new_carry = (next_st, k, _tree_add(grad_sum, g), loss_sum + loss)
+      # ys carries microbatch data + metrics so we can build critic batch + avg metrics
+      ys = (mb_data, metrics)
+      return new_carry, ys
+
+    init_grad = _tree_zeros_like(policy_params)
+    (state, key_out, grad_sum, loss_sum), (mb_datas, metrics_seq) = jax.lax.scan(
+      body, (state, key, init_grad, 0.0), None,
+      length=policy_grad_accum_steps
+    )
+
+    # Concatenate microbatch data into a full batch: (accum_steps, num_envs, T, ...) -> (B, T, ...)
+    data = jax.tree_util.tree_map(
+      lambda x: x.reshape((-1,) + x.shape[2:]),  # merge [accum_steps, num_envs] -> B
+      mb_datas,
+    )
+
+    grad_avg    = _tree_div(grad_sum, denom)
+    loss_avg    = loss_sum / denom
+    metrics_avg = _tree_div(metrics_seq, denom)  # tree-wise mean over the first axis
+
+    grad_avg = jax.lax.pmean(grad_avg, axis_name=_PMAP_AXIS_NAME)
+    return loss_avg, (state, data, metrics_avg), grad_avg, key_out
+
   policy_gradient_update_fn = gradients.gradient_update_fn(
     rollout_loss_fn, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
@@ -413,15 +485,25 @@ def train(
     training_state, state, key = carry
     key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
 
-    (policy_loss, (state, data, policy_metrics)), policy_params, policy_optimizer_state = policy_gradient_update_fn(
+    # (policy_loss, (state, data, policy_metrics)), policy_params, policy_optimizer_state = policy_gradient_update_fn(
+    #   training_state.policy_params,
+    #   training_state.target_value_params,
+    #   training_state.normalizer_params,
+    #   state,
+    #   key_generate_unroll,
+    #   optimizer_state=training_state.policy_optimizer_state
+    # )
+
+    policy_loss, (state, data, policy_metrics), grad_avg, key_generate_unroll = rollout_loss_grad_accum(
       training_state.policy_params,
       training_state.target_value_params,
       training_state.normalizer_params,
       state,
       key_generate_unroll,
-      optimizer_state=training_state.policy_optimizer_state
     )
-    # jax.debug.breakpoint()
+
+    updates, policy_optimizer_state = policy_optimizer.update(grad_avg, training_state.policy_optimizer_state)
+    policy_params = optax.apply_updates(training_state.policy_params, updates)
 
     # Update normalization params and normalize observations.
     normalizer_params = running_statistics.update(

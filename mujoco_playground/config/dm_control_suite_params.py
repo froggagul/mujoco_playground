@@ -25,19 +25,28 @@ def brax_ppo_config(env_name: str) -> config_dict.ConfigDict:
 
   rl_config = config_dict.create(
       num_timesteps=60_000_000,
-      num_evals=10,
+      num_evals=500,
+      num_eval_envs=64,
+
       reward_scaling=10.0,
       episode_length=env_config.episode_length,
       normalize_observations=True,
       action_repeat=1,
-      unroll_length=30,
-      num_minibatches=32,
+
+      num_envs=64,
+      unroll_length=32,
       num_updates_per_batch=16,
-      discounting=0.995,
+      num_minibatches=4,
+      batch_size=512,
+
+      discounting=0.99,
       learning_rate=1e-3,
       entropy_cost=1e-2,
-      num_envs=2048,
-      batch_size=1024,
+  )
+  rl_config.network_factory = config_dict.create(
+      policy_hidden_layer_sizes=(64, 64),
+      value_hidden_layer_sizes=(64, 64),
+      # activation=linen.elu,
   )
 
   if env_name.startswith("AcrobotSwingup"):

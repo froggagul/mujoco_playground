@@ -1,7 +1,7 @@
 <mujoco model="g1_29dof_rev_1_0">
   <compiler angle="radian"/>
 
-  <option iterations="3" ls_iterations="5" timestep=".002" integrator="Euler">
+  <option iterations="1" ls_iterations="5" timestep=".001" integrator="Euler">
     <flag eulerdamp="disable"/>
   </option>
 
