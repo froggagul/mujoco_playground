@@ -41,6 +41,7 @@ from mujoco_playground.config import locomotion_params
 from mujoco_playground.config import manipulation_params
 import tensorboardX
 import wandb
+jax.config.update("jax_enable_x64", True)
 
 
 xla_flags = os.environ.get("XLA_FLAGS", "")
@@ -529,8 +530,9 @@ def main(argv):
   for i, rollout in enumerate(trajectories):
     traj = rollout[::render_every]
     frames = eval_env.render(
-        traj, height=480, width=640, scene_option=scene_option, camera="lookatcart", #"track",
+        traj, height=480, width=640, scene_option=scene_option, camera="track", #"track",
     )
+    i = 1
     media.write_video(f"ppo_rollout{i}.mp4", frames, fps=fps)
     print(f"Rollout video saved as 'ppo_rollout{i}.mp4'.")
 

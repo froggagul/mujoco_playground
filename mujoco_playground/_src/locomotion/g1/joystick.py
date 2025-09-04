@@ -32,7 +32,7 @@ from mujoco_playground._src.locomotion.g1 import g1_constants as consts
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
       ctrl_dt=0.02,
-      sim_dt=0.001,
+      sim_dt=0.004,
       episode_length=1000,
       action_repeat=1,
       action_scale=0.5,
