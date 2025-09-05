@@ -55,7 +55,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["MUJOCO_GL"] = "egl"
 
 # Ignore the info logs from brax
-logging.set_verbosity(logging.INFO)
+logging.set_verbosity(logging.WARNING)
 
 # Suppress warnings
 
@@ -218,6 +218,43 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
           value_obs_key="privileged_state",
         ),
     )
+  elif env_name == "Go1JoystickFlatTerrain":
+    env_config = locomotion.get_default_config(env_name)
+    rl_config = config_dict.create(
+        num_timesteps=200_000_000,
+        num_evals=2000,
+        num_eval_envs=64,
+        num_resets_per_eval=0,
+
+        reward_scaling=1.0,
+        episode_length=env_config.episode_length,
+        normalize_observations=True,
+        action_repeat=1,
+
+        num_envs=512,
+        unroll_length=20, # rollout length per policy, short horizon length
+        batch_size=2048, # batch_size
+
+        num_critic_update=16, # update number of critic
+        num_critic_minibatch_per_update=4, # number of minibatches when per critic update
+        policy_grad_accum_steps=1,
+
+        discounting=0.99,
+        actor_learning_rate=0.001,
+        critic_learning_rate=0.001,
+        entropy_cost=0.0,
+
+        # SHAC specific parameters
+        alpha=0.9,
+        lambda_=0.95,  # GAE lambda parameter
+
+        network_factory=config_dict.create(
+          policy_hidden_layer_sizes=(512, 128),
+          value_hidden_layer_sizes=(512, 128),
+          policy_obs_key="state",
+          value_obs_key="privileged_state",
+        ),
+    )
   elif env_name == "CartpoleBalance":
     env_config = dm_control_suite.get_default_config(env_name)
     rl_config = config_dict.create(
@@ -238,6 +275,7 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
 
         num_critic_update=16, # update number of critic
         num_critic_minibatch_per_update=4, # number of minibatches when per critic update
+        policy_grad_accum_steps=1,
 
         discounting=0.99,
         actor_learning_rate=0.001,
